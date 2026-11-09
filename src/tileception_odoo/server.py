@@ -13,6 +13,7 @@ from datetime import datetime
 from . import __version__
 from .config import Config, Paths
 from .embeddings import Embedder
+from .progress import read_progress
 from .store import Store, launcher_row
 from .sync import scope
 
@@ -54,7 +55,13 @@ class Server:
         return store
 
     def status(self) -> dict:
-        status = {"last_success": None, "last_error": "", "semantic_error": self.semantic_error, "records": 0}
+        status = {
+            "last_success": None,
+            "last_error": "",
+            "semantic_error": self.semantic_error,
+            "records": 0,
+            "sync_progress": read_progress(self.paths),
+        }
         try:
             config = Config.load(self.paths)
             if self.paths.database.exists():
@@ -94,7 +101,22 @@ class Server:
                 "actions": [],
             },
         ]
+        progress = status["sync_progress"]
+        if progress and progress.get("state") != "complete":
+            state = progress.get("state")
+            rows.insert(
+                1,
+                {
+                    "title": {"running": "Sync in progress", "failed": "Sync failed"}.get(
+                        state, "Sync interrupted"
+                    ),
+                    "detail": progress["message"],
+                    "actions": [],
+                },
+            )
         for key in ("last_error", "semantic_error"):
+            if key == "last_error" and progress and progress.get("state") == "running":
+                continue
             if status[key]:
                 rows.append(
                     {

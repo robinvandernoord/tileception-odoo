@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS records (
     model TEXT NOT NULL, id INTEGER NOT NULL, title TEXT NOT NULL,
     project TEXT NOT NULL, stage TEXT NOT NULL, tags TEXT NOT NULL,
     description TEXT NOT NULL, url TEXT NOT NULL, content_hash TEXT NOT NULL,
-    write_date TEXT NOT NULL, PRIMARY KEY(model,id)
+    write_date TEXT NOT NULL, embedding_complete INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY(model,id)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
     title, project, tags, description, content='records', content_rowid='rowid',
@@ -57,6 +58,13 @@ class Store:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA foreign_keys=ON")
             self.db.executescript(SCHEMA)
+            columns = {row[1] for row in self.db.execute("PRAGMA table_info(records)")}
+            if "embedding_complete" not in columns:
+                # Older caches committed whole runs, so every existing record is complete.
+                self.db.execute(
+                    "ALTER TABLE records ADD COLUMN embedding_complete INTEGER NOT NULL DEFAULT 1"
+                )
+                self.db.commit()
             filename.chmod(0o600)
         else:
             self.db = sqlite3.connect(f"{filename.as_uri()}?mode=ro", uri=True, timeout=0.2)
@@ -77,38 +85,76 @@ class Store:
     def set(self, key: str, value: str):
         self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, value))
 
-    def put(self, record: dict, embedder):
+    def put(self, record: dict, embedder, on_progress=None) -> tuple[int, int]:
+        """Save metadata and each inference batch; reuse committed chunks on retry.
+
+        Returns newly embedded and reused chunk counts. Callers must not wrap
+        this in a larger transaction: every completed batch is durable here.
+        """
         # Stage, tags and project are searchable metadata but do not change title/description embeddings.
         digest = hashlib.sha256(
             json.dumps([IDENTITY, record["title"], record["description"]], ensure_ascii=False).encode()
         ).hexdigest()
         key = (record["model"], record["id"])
-        old = self.db.execute("SELECT content_hash FROM records WHERE model=? AND id=?", key).fetchone()
-        self.db.execute(
-            """
-            INSERT INTO records VALUES (
-                :model,:id,:title,:project,:stage,:tags,:description,:url,:hash,:write_date
+        old = self.db.execute(
+            "SELECT content_hash,embedding_complete FROM records WHERE model=? AND id=?",
+            key,
+        ).fetchone()
+        unchanged = old is not None and old["content_hash"] == digest
+        complete = unchanged and bool(old["embedding_complete"])
+        with self.transaction():
+            self.db.execute(
+                """
+                INSERT INTO records (
+                    model,id,title,project,stage,tags,description,url,content_hash,write_date,embedding_complete
+                ) VALUES (
+                    :model,:id,:title,:project,:stage,:tags,:description,:url,:hash,:write_date,:complete
+                )
+                ON CONFLICT(model,id) DO UPDATE SET title=excluded.title, project=excluded.project,
+                stage=excluded.stage, tags=excluded.tags, description=excluded.description,
+                url=excluded.url, content_hash=excluded.content_hash, write_date=excluded.write_date,
+                embedding_complete=excluded.embedding_complete
+                """,
+                {**record, "hash": digest, "complete": int(complete)},
             )
-            ON CONFLICT(model,id) DO UPDATE SET title=excluded.title, project=excluded.project,
-            stage=excluded.stage, tags=excluded.tags, description=excluded.description,
-            url=excluded.url, content_hash=excluded.content_hash, write_date=excluded.write_date
-        """,
-            {**record, "hash": digest},
-        )
-        if old and old[0] == digest:
-            return
-        self.db.execute("DELETE FROM chunks WHERE model=? AND record_id=?", key)
+            if not unchanged:
+                self.db.execute("DELETE FROM chunks WHERE model=? AND record_id=?", key)
+        existing = {
+            row[0]
+            for row in self.db.execute(
+                "SELECT position FROM chunks WHERE model=? AND record_id=?",
+                key,
+            )
+        }
+        if complete:
+            if on_progress:
+                on_progress(len(existing), len(existing), 0)
+            return 0, len(existing)
         chunks = embedder.chunks(record["title"], record["description"])
-        for start in range(0, len(chunks), 4):
-            batch = chunks[start : start + 4]
-            vectors = embedder.encode(batch)
-            self.db.executemany(
-                "INSERT INTO chunks VALUES (?,?,?,?,?)",
-                [
-                    (*key, start + offset, text, vector.tobytes())
-                    for offset, (text, vector) in enumerate(zip(batch, vectors, strict=True))
-                ],
-            )
+        missing = [(position, text) for position, text in enumerate(chunks) if position not in existing]
+        created = 0
+        if on_progress:
+            on_progress(len(existing), len(chunks), created)
+        for start in range(0, len(missing), 4):
+            batch = missing[start : start + 4]
+            vectors = embedder.encode([text for _, text in batch])
+            with self.transaction():
+                self.db.executemany(
+                    "INSERT INTO chunks VALUES (?,?,?,?,?)",
+                    [
+                        (*key, position, text, vector.tobytes())
+                        for (position, text), vector in zip(batch, vectors, strict=True)
+                    ],
+                )
+                created += len(batch)
+                if len(existing) + created == len(chunks):
+                    self.db.execute("UPDATE records SET embedding_complete=1 WHERE model=? AND id=?", key)
+            if on_progress:
+                on_progress(len(existing) + created, len(chunks), created)
+        if not missing:
+            with self.transaction():
+                self.db.execute("UPDATE records SET embedding_complete=1 WHERE model=? AND id=?", key)
+        return created, len(existing)
 
     def remove(self, model: str, record_id: int):
         self.db.execute("DELETE FROM records WHERE model=? AND id=?", (model, record_id))

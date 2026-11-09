@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .config import DEFAULT_WEB_URL, Config, Paths, default_json2_url, private_directory, validate_url
@@ -68,6 +69,38 @@ def setup_model(paths: Paths):
     print("Local embedding model is ready", flush=True)
 
 
+def initial_sync(paths: Paths):
+    """Wait for the limited user service while forwarding its private progress."""
+    from .progress import read_progress
+
+    command = ["systemctl", "--user", "start", "tileception-odoo-sync.service"]
+    previous = read_progress(paths)
+    previous_update = previous.get("updated") if previous else None
+    previous_phase = previous.get("phase") if previous else None
+    last_output = 0.0
+    with subprocess.Popen(command) as process:
+        while True:
+            try:
+                result = process.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                result = None
+            progress = read_progress(paths)
+            now = time.monotonic()
+            if (
+                progress
+                and progress.get("updated") != previous_update
+                and (result is not None or progress.get("phase") != previous_phase or now - last_output >= 2)
+            ):
+                print(progress["message"], flush=True)
+                previous_update = progress.get("updated")
+                previous_phase = progress.get("phase")
+                last_output = now
+            if result is not None:
+                if result:
+                    raise subprocess.CalledProcessError(result, command)
+                return
+
+
 def install(paths: Paths, enable_timer: bool):
     command = shutil.which("tileception-odoo")
     if not command:
@@ -106,7 +139,7 @@ def install(paths: Paths, enable_timer: bool):
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     print("Running the initial Odoo synchronization; this may take a while.", flush=True)
     try:
-        subprocess.run(["systemctl", "--user", "start", "tileception-odoo-sync.service"], check=True)
+        initial_sync(paths)
     except subprocess.CalledProcessError:
         detail = ""
         if paths.database.exists():

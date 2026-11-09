@@ -122,13 +122,35 @@ systemctl --user list-timers tileception-odoo-sync.timer
 journalctl --user -u tileception-odoo-sync.service
 ```
 
+`tileception-odoo sync` prints live progress directly in your terminal. To run
+through systemd and follow the same messages, start it yourself with:
+
+```sh
+systemctl --user start --no-block tileception-odoo-sync.service
+journalctl --user -fu tileception-odoo-sync.service
+```
+
+Progress includes fetching projects/tasks, completed records out of the total,
+saved embedding chunks for the current record, and new versus reused embeddings.
+Long records report progress after every committed inference batch, with terminal
+and journal messages limited to about one every two seconds. `install` forwards
+the service's progress while it waits. `tileception-odoo status` exposes the
+same counters as JSON, and `odoo ` shows a progress row. Reopen it to refresh.
+Progress is stored privately in `~/.cache/tileception-odoo/progress.json`.
+
 The persistent calendar timer runs every 15 minutes with up to two minutes of
 random delay. The service has low CPU/I/O priority and a 50% CPU quota. Catch-up
 occurs when the user manager starts; running while logged out additionally
 requires systemd lingering, which this installer does not enable.
 
 Synchronization pages by ID and filters on `write_date` with a five-minute
-overlap. It advances the checkpoint only after the complete transaction succeeds.
+overlap. Metadata and embedding batches commit as indexing proceeds. At most
+four new embedding chunks are inferred per batch, and completed batches survive
+an interruption, even partway through one long record. Rerunning sync fetches
+changes again and reuses completed records and chunks whose content hash matches.
+Only the currently uncommitted batch has to be recomputed.
+
+The synchronization checkpoint advances only after the full run succeeds.
 The checkpoint uses the local UTC start time, so keep the Odoo server and client
 clocks synchronized. Once daily, it reads all accessible records, including
 archived ones, refreshes metadata and removes archived, deleted and inaccessible
@@ -139,8 +161,12 @@ recomputing title/description vectors. A model/chunking identity change forces
 reindexing. SQLite WAL permits readers during updates; a nonblocking `flock`
 prevents overlapping sync and model setup processes.
 
-A failed sync rolls back record changes and preserves the previous checkpoint
-and cache, then records an error for the plugin's status view. **Sync Odoo now**
+A failed sync preserves committed batches and the previous synchronization
+checkpoint, then records an error for the plugin's status view. Only the active
+transaction rolls back. Completed batches are searchable before the run finishes.
+Reconciliation removes missing records only after the complete listing and all
+indexing have succeeded. An interrupted run is marked as such when its writer
+lock is no longer held. **Sync Odoo now**
 starts the installed user service without waiting for indexing. Reopen `odoo `
 to see current status. Keep the previous cache available during outages.
 
