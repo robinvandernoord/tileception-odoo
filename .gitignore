@@ -1,0 +1,13 @@
+venv*
+.venv/
+__pycache__/
+*.pyc
+dist/
+*.egg-info/
+.ruff_cache/
+.env
+*.sqlite3*
+*.onnx
+*.log
+.toml
+
