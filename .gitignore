@@ -10,4 +10,5 @@ dist/
 *.onnx
 *.log
 .toml
+uv.lock
 
