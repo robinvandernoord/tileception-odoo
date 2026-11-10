@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import stat
 import tomllib
 from dataclasses import dataclass
@@ -10,6 +12,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 DEFAULT_WEB_URL = "https://educationwarehouse.nl"
+# Pseudo-project ID for tasks without a project; Odoo record IDs start at 1.
+NO_PROJECT = 0
+PROJECT_LIST_KEYS = ("include_projects", "exclude_projects")
 
 
 def validate_url(value: str, label: str, example: str) -> str:
@@ -75,6 +80,8 @@ class Config:
     api_key_file: Path
     threads: int = 2
     debounce_ms: int = 180
+    include_projects: frozenset[int] = frozenset()
+    exclude_projects: frozenset[int] = frozenset()
 
     @classmethod
     def load(cls, paths: Paths, use_environment: bool = True) -> Config:
@@ -98,7 +105,13 @@ class Config:
             api_key_file=Path(values.get("api_key_file", str(paths.config / "api-key"))).expanduser(),
             threads=max(1, min(4, int(values.get("threads", 2)))),
             debounce_ms=max(50, min(1000, int(values.get("debounce_ms", 180)))),
+            include_projects=project_ids(values, "include_projects"),
+            exclude_projects=project_ids(values, "exclude_projects"),
         )
+
+    def project_filter(self) -> str:
+        """Stable fingerprint of the project selection, stored with the cache."""
+        return json.dumps([sorted(self.include_projects), sorted(self.exclude_projects)])
 
     def api_key(self, use_environment: bool = True) -> str:
         if use_environment and (value := os.environ.get("ODOO_API_KEY")):
@@ -115,3 +128,72 @@ class Config:
         if not value:
             raise ValueError("API key file is empty")
         return value
+
+
+def project_ids(values: dict, key: str) -> frozenset[int]:
+    value = values.get(key, [])
+    if not isinstance(value, list) or not all(
+        isinstance(item, int) and not isinstance(item, bool) and item >= 0 for item in value
+    ):
+        raise ValueError(
+            f"{key} must be a list of Odoo project IDs; use {NO_PROJECT} for tasks without a project"
+        )
+    return frozenset(value)
+
+
+def assignment_lines(lines: list[str], key: str) -> range | None:
+    """Locate a top-level integer-array assignment, including multi-line arrays with comments."""
+    pattern = re.compile(rf"^{re.escape(key)}\s*=")
+    for start, line in enumerate(lines):
+        if not pattern.match(line):
+            continue
+        depth = 0
+        for end in range(start, len(lines)):
+            # Integer arrays contain no strings, so everything after # is a comment.
+            code = lines[end].split("#", 1)[0]
+            depth += code.count("[") - code.count("]")
+            if depth <= 0:
+                return range(start, end + 1)
+        raise ValueError(f"Unterminated {key} array in config.toml")
+    return None
+
+
+def format_project_list(key: str, ids: set[int], names: dict[int, str]) -> list[str]:
+    if not ids:
+        return [f"{key} = []"]
+    lines = [f"{key} = ["]
+    for project in sorted(ids, key=lambda item: (names.get(item, "").casefold(), item)):
+        name = " ".join(names.get(project, "").split())
+        lines.append(f"    {project},  # {name}" if name else f"    {project},")
+    return [*lines, "]"]
+
+
+def replace_assignment(text: str, key: str, replacement: list[str]) -> str:
+    lines = text.splitlines()
+    found = assignment_lines(lines, key)
+    if found is None:
+        # Top-level keys must precede the first [table] header to stay top-level.
+        table = next((index for index, line in enumerate(lines) if line.lstrip().startswith("[")), len(lines))
+        lines[table:table] = replacement
+    else:
+        lines[found.start : found.stop] = replacement
+    return "\n".join(lines) + "\n"
+
+
+def preserved_assignments(text: str, keys=PROJECT_LIST_KEYS) -> list[str]:
+    """Raw assignment lines for keys, so rewriting other settings keeps hand-written comments."""
+    lines = text.splitlines()
+    output = []
+    for key in keys:
+        if (found := assignment_lines(lines, key)) is not None:
+            output.extend(lines[found.start : found.stop])
+    return output
+
+
+def write_private(filename: Path, text: str):
+    tomllib.loads(text)  # Never replace a working configuration with an unparsable one.
+    temporary = filename.with_suffix(".tmp")
+    with temporary.open("w") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(text)
+    temporary.replace(filename)

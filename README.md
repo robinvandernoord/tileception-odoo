@@ -56,6 +56,26 @@ Paths follow XDG conventions:
 Use `tileception-odoo configure` to change credentials and
 `tileception-odoo setup-model` to repair or download model files.
 
+## Choosing projects
+
+By default every project is synchronized. To limit this, list Odoo project IDs
+in `config.toml`; `0` stands for tasks without a project:
+
+```toml
+include_projects = [12, 48, 0]  # empty or absent: all projects
+exclude_projects = [7]          # always wins over include_projects
+```
+
+`tileception-odoo projects` opens a picker for `include_projects`: type to
+filter, Space or Tab to toggle, Ctrl-A to toggle every shown project, Ctrl-X
+to clear, Enter to save and Esc to cancel. Edit `exclude_projects` by hand.
+`configure` keeps both lists.
+
+Filtering happens in Odoo, so excluded records are not downloaded or embedded.
+After the selection changes, the next sync fetches everything selected and
+removes the rest from the cache. Records that stay selected keep their
+embeddings.
+
 ## Search and privacy
 
 Search combines exact IDs/URLs, partial and fuzzy text matching, and

@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from .config import Config
+from .config import NO_PROJECT, Config
 
 MODELS = ("project.project", "project.task")
 
@@ -81,6 +81,41 @@ class OdooClient:
             raise ValueError(f"Invalid metadata for {model}")
         return result
 
+    def project_domain(self, model: str) -> list:
+        """Restrict a sync to the configured projects; the exclude list always wins."""
+        field = "id" if model == "project.project" else "project_id"
+        domain = []
+        for ids, negate in ((self.config.include_projects, False), (self.config.exclude_projects, True)):
+            if not ids:
+                continue
+            real = sorted(ids - {NO_PROJECT})
+            if model == "project.project":
+                terms = [[field, "in", real]]
+            else:
+                terms = [[field, "in", real]] if real else []
+                if NO_PROJECT in ids:
+                    terms.append([field, "=", False])
+            if not terms:
+                # Only the no-project pseudo-project is listed, which matches no real project.
+                terms = [[field, "in", []]]
+            # "!" keeps negation explicit, so tasks without a project are not silently included or dropped.
+            expression = ["|"] * (len(terms) - 1) + terms
+            domain += ["!", *expression] if negate else expression
+        return domain
+
+    def projects(self) -> list[dict]:
+        """Active projects for the picker, by name."""
+        result = self.call(
+            "project.project",
+            "search_read",
+            {"domain": [], "fields": ["id", "name"], "order": "name asc, id asc"},
+        )
+        if not isinstance(result, list) or not all(
+            isinstance(row, dict) and isinstance(row.get("id"), int) for row in result
+        ):
+            raise ValueError("Invalid project list from Odoo")
+        return result
+
     def records(self, model: str, since: str | None):
         metadata = self.metadata(model)
         fields = ["id", "name", "write_date"]
@@ -95,6 +130,7 @@ class OdooClient:
             domain = [["id", ">", cursor]]
             if since:
                 domain.append(["write_date", ">=", since])
+            domain += self.project_domain(model)
             page = self.call(
                 model,
                 "search_read",

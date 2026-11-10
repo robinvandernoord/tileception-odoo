@@ -13,7 +13,19 @@ import sys
 import time
 from pathlib import Path
 
-from .config import DEFAULT_WEB_URL, Config, Paths, default_json2_url, private_directory, validate_url
+from .config import (
+    DEFAULT_WEB_URL,
+    NO_PROJECT,
+    Config,
+    Paths,
+    default_json2_url,
+    format_project_list,
+    preserved_assignments,
+    private_directory,
+    replace_assignment,
+    validate_url,
+    write_private,
+)
 
 SERVICE = """[Unit]
 Description=Update private Odoo search cache
@@ -51,6 +63,9 @@ json2_url = "{default_json2_url(DEFAULT_WEB_URL)}"
 database = ""
 threads = 2
 debounce_ms = 180
+# Odoo project IDs; 0 means tasks without a project. Edit with: tileception-odoo projects
+# include_projects = []  # empty: all projects
+# exclude_projects = []  # always wins over include_projects
 """
 
 
@@ -196,12 +211,62 @@ def configure(paths: Paths):
         os.fchmod(handle.fileno(), 0o600)
         handle.write(key + "\n")
     config = paths.config / "config.toml"
-    config.write_text(
+    # Keep the project selection; it is unrelated to the connection settings entered here.
+    kept = preserved_assignments(config.read_text()) if config.exists() else []
+    write_private(
+        config,
         f"web_url = {json.dumps(web)}\njson2_url = {json.dumps(endpoint)}\n"
         f"database = {json.dumps(database)}\nthreads = 2\ndebounce_ms = 180\n"
+        + "".join(line + "\n" for line in kept),
     )
-    config.chmod(0o600)
     print(f"Saved private configuration in {paths.config}")
+
+
+def choose_projects(paths: Paths):
+    from .odoo import OdooClient
+    from .picker import Entry, pick
+
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ValueError(
+            "The project picker needs an interactive terminal; edit include_projects in config.toml"
+        )
+    settings = Config.load(paths)
+    print("Fetching projects from Odoo...", flush=True)
+    rows = OdooClient(settings).projects()
+    names = {row["id"]: str(row.get("name") or "Untitled") for row in rows}
+    entries = [Entry(NO_PROJECT, "(no project)", "tasks without a project")]
+    entries += [Entry(project, name) for project, name in names.items()]
+    # Keep IDs that Odoo no longer lists, so saving never drops them silently.
+    entries += [
+        Entry(project, "Unknown project", "archived or inaccessible")
+        for project in sorted(settings.include_projects - names.keys() - {NO_PROJECT})
+    ]
+    names[NO_PROJECT] = "tasks without a project"
+    chosen = pick(entries, set(settings.include_projects), set(settings.exclude_projects))
+    if chosen is None or chosen == settings.include_projects:
+        print("Project selection unchanged")
+        return
+    filename = paths.config / "config.toml"
+    text = filename.read_text() if filename.exists() else CONFIG_EXAMPLE
+    write_private(
+        filename,
+        replace_assignment(text, "include_projects", format_project_list("include_projects", chosen, names)),
+    )
+    if chosen:
+        print(f"Saved {len(chosen)} project(s) to synchronize in {filename}")
+    else:
+        print(f"Saved: all projects will be synchronized ({filename})")
+    if settings.exclude_projects & chosen:
+        print("Note: some selected projects are also in exclude_projects, which wins.")
+    if input("Synchronize now to apply the selection? [Y/n] ").strip().lower() not in {"", "y", "yes"}:
+        print("The next sync applies the new selection.")
+        return
+    if (paths.config.parent / "systemd/user/tileception-odoo-sync.service").exists():
+        initial_sync(paths)
+    else:
+        from .sync import synchronize
+
+        synchronize(paths, Config.load(paths))
 
 
 def main():
@@ -213,6 +278,7 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("serve", "sync", "configure", "setup-model", "status"):
         sub.add_parser(name)
+    sub.add_parser("projects", help="choose which Odoo projects to synchronize")
     installer = sub.add_parser("install")
     installer.add_argument("--enable-timer", action="store_true")
     args = parser.parse_args()
@@ -233,6 +299,8 @@ def main():
             install(paths, enable_timer=args.enable_timer)
         elif args.command == "configure":
             configure(paths)
+        elif args.command == "projects":
+            choose_projects(paths)
         elif args.command == "status":
             from .server import Server
 

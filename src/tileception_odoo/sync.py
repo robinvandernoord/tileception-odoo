@@ -86,8 +86,12 @@ def synchronize(paths: Paths, config: Config):
             changed_scope = store.get("scope") != scope(config) or store.get("auth") != auth
             checkpoint = None if changed_scope else store.get("checkpoint")
             previous_reconcile = store.get("reconciled")
+            # A new project selection needs complete listings: newly included projects have
+            # old tasks behind the checkpoint, and deselected records must be pruned.
+            changed_filter = store.get("project_filter") != config.project_filter()
             reconcile = (
                 not checkpoint
+                or changed_filter
                 or not previous_reconcile
                 or started - datetime.fromisoformat(previous_reconcile) >= timedelta(days=1)
                 or store.get("embedding_identity") != IDENTITY
@@ -129,7 +133,7 @@ def synchronize(paths: Paths, config: Config):
                     store.db.execute("DELETE FROM records")
                     store.db.execute(
                         "DELETE FROM meta WHERE key IN "
-                        "('checkpoint','last_success','reconciled','embedding_identity')"
+                        "('checkpoint','last_success','reconciled','embedding_identity','project_filter')"
                     )
                 # Persist cache ownership before batching. Retries must reuse the
                 # new account's saved chunks instead of clearing them again.
@@ -209,6 +213,8 @@ def synchronize(paths: Paths, config: Config):
                 store.set("embedding_identity", IDENTITY)
                 if reconcile:
                     store.set("reconciled", started.isoformat())
+                    # Recorded only after pruning, so a failed run retries the full listing.
+                    store.set("project_filter", config.project_filter())
             progress.update(
                 f"Synchronization complete: {processed}/{total} records; "
                 f"{embedded} embedding chunks new, {reused} reused",
