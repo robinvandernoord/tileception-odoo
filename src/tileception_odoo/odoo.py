@@ -40,10 +40,12 @@ class CanonicalRedirect(HTTPRedirectHandler):
 
 
 class OdooClient:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, key: str | None = None, timeout: float = 30):
         self.config = config
         self.endpoint = config.json2_url
-        self.key = config.api_key()
+        # An explicit key lets setup check a connection before saving anything.
+        self.key = key or config.api_key()
+        self.timeout = timeout
         self.opener = build_opener(CanonicalRedirect())
 
     def call(self, model: str, method: str, body: dict[str, Any]) -> Any:
@@ -59,7 +61,7 @@ class OdooClient:
             method="POST",
         )
         try:
-            with self.opener.open(request, timeout=30) as response:
+            with self.opener.open(request, timeout=self.timeout) as response:
                 self.endpoint = response.geturl().removesuffix(f"/{model}/{method}")
                 raw = response.read(32 * 1024 * 1024 + 1)
                 if len(raw) > 32 * 1024 * 1024:
@@ -74,6 +76,17 @@ class OdooClient:
         if not isinstance(result, (list, dict)) or isinstance(result, dict) and "error" in result:
             raise ValueError("Odoo returned an API error or invalid response")
         return result
+
+    def check(self):
+        """Fail unless the URL, database and key can read projects."""
+        try:
+            self.call("project.project", "search_read", {"domain": [], "fields": ["id"], "limit": 1})
+        except ValueError as error:
+            if "HTTP 401" in str(error) or "HTTP 403" in str(error):
+                raise ValueError("Odoo refused the API key; check it and the database") from None
+            if "Could not reach" in str(error):
+                raise ValueError(f"Could not reach {self.config.json2_url}; check the URLs") from None
+            raise
 
     def metadata(self, model: str) -> dict:
         result = self.call(model, "fields_get", {"attributes": ["type", "relation"]})

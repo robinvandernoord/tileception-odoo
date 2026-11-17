@@ -20,11 +20,24 @@ from .config import (
     Paths,
     default_json2_url,
     format_project_list,
-    preserved_assignments,
     private_directory,
     replace_assignment,
     validate_url,
     write_private,
+)
+from .setup import (
+    SERVICE_NAME,
+    TIMER_NAME,
+    check_outside_repositories,
+    configuration_state,
+    connection,
+    current_settings,
+    has_api_key,
+    manifest_path,
+    save_settings,
+    setup_prompt,
+    start_background_sync,
+    units_directory,
 )
 
 SERVICE = """[Unit]
@@ -116,11 +129,6 @@ def initial_sync(paths: Paths):
                 return
 
 
-def start_background_sync():
-    """Queue the first sync without holding an unattended installer for its duration."""
-    subprocess.run(["systemctl", "--user", "start", "--no-block", "tileception-odoo-sync.service"], check=True)
-
-
 def install(paths: Paths, enable_timer: bool, non_interactive: bool = False):
     interactive = sys.stdin.isatty() and not non_interactive
     command = shutil.which("tileception-odoo")
@@ -133,40 +141,39 @@ def install(paths: Paths, enable_timer: bool, non_interactive: bool = False):
     if not config.exists():
         config.write_text(CONFIG_EXAMPLE)
         config.chmod(0o600)
-    try:
-        # The user service cannot rely on this terminal's Odoo environment variables.
-        settings = Config.load(paths, use_environment=False)
-        settings.api_key(use_environment=False)
-    except OSError, ValueError:
-        if not interactive:
-            raise ValueError(
-                "Odoo configuration is incomplete. Run install in a terminal to enter your URLs and API key, "
-                "or provision the private configuration and key file before unattended installation."
-            ) from None
+    # The user service cannot rely on this terminal's Odoo environment variables.
+    configured, detail = configuration_state(paths)
+    if configured:
+        print("Using your existing Odoo configuration", flush=True)
+    elif interactive:
         print("Set up your Odoo connection first.", flush=True)
         configure(paths)
-    else:
-        print("Using your existing Odoo configuration", flush=True)
+        configured = True
     setup_model(paths)
-    units = paths.config.parent / "systemd/user"
+    units = units_directory(paths)
     units.mkdir(parents=True, exist_ok=True)
-    (units / "tileception-odoo-sync.service").write_text(SERVICE.format(command=unit_quote(command)))
-    (units / "tileception-odoo-sync.timer").write_text(TIMER)
-    manifests = paths.data.parent / "tileception/plugins"
-    manifests.mkdir(parents=True, exist_ok=True)
-    (manifests / "odoo.toml").write_text(
+    (units / SERVICE_NAME).write_text(SERVICE.format(command=unit_quote(command)))
+    (units / TIMER_NAME).write_text(TIMER)
+    manifest = manifest_path(paths)
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
         f'command = {json.dumps(command)}\nargs = ["serve"]\n[launcher]\nprefixes = ["odoo"]\n'
     )
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     if not interactive:
+        if enable_timer:
+            subprocess.run(["systemctl", "--user", "enable", "--now", TIMER_NAME], check=True)
+        if not configured:
+            # Tileception reads `status` next and asks for the connection; configure starts the sync.
+            print(f"Odoo search is installed but not set up yet: {detail}.", flush=True)
+            print("Set it up with: tileception-odoo configure", flush=True)
+            return
         start_background_sync()
         print(
             "Initial Odoo synchronization started in the background; "
             "check progress with tileception-odoo status.",
             flush=True,
         )
-        if enable_timer:
-            subprocess.run(["systemctl", "--user", "enable", "--now", "tileception-odoo-sync.timer"], check=True)
         print("Odoo search is installed. Restart Tileception to discover the plugin.")
         return
     print("Running the initial Odoo synchronization; this may take a while.", flush=True)
@@ -197,7 +204,7 @@ def install(paths: Paths, enable_timer: bool, non_interactive: bool = False):
             "yes",
         }
     if enable_timer:
-        subprocess.run(["systemctl", "--user", "enable", "--now", "tileception-odoo-sync.timer"], check=True)
+        subprocess.run(["systemctl", "--user", "enable", "--now", TIMER_NAME], check=True)
     print("Odoo search is ready. Restart Tileception to discover the plugin.")
 
 
@@ -211,32 +218,72 @@ def prompt_url(label: str, example: str, default: str = "") -> str:
 
 
 def configure(paths: Paths):
+    from .odoo import OdooClient
+
     private_directory(paths.config)
-    for parent in (paths.config.resolve(), *paths.config.resolve().parents):
-        if (parent / ".git").exists() or (parent / "pyproject.toml").exists():
-            raise ValueError("Store configuration and credentials outside repositories")
-    web = prompt_url("Odoo web URL", DEFAULT_WEB_URL, default=DEFAULT_WEB_URL)
-    endpoint = prompt_url("JSON-2 URL", default_json2_url(web), default=default_json2_url(web))
-    database = input("Odoo database (optional): ").strip()
-    key = getpass.getpass("Odoo read-only API key: ", echo_char="*").strip()
-    if not key:
-        raise ValueError("API key must not be empty")
-    key_path = paths.config / "api-key"
-    if key_path.is_symlink():
-        raise ValueError("API key path must not be a symlink")
-    with key_path.open("w") as handle:
-        os.fchmod(handle.fileno(), 0o600)
-        handle.write(key + "\n")
-    config = paths.config / "config.toml"
-    # Keep the project selection; it is unrelated to the connection settings entered here.
-    kept = preserved_assignments(config.read_text()) if config.exists() else []
-    write_private(
-        config,
-        f"web_url = {json.dumps(web)}\njson2_url = {json.dumps(endpoint)}\n"
-        f"database = {json.dumps(database)}\nthreads = 2\ndebounce_ms = 180\n"
-        + "".join(line + "\n" for line in kept),
-    )
+    check_outside_repositories(paths)
+    web, endpoint, database = current_settings(paths)
+    keep_key = has_api_key(paths)
+    while True:
+        web = prompt_url("Odoo web URL", DEFAULT_WEB_URL, default=web)
+        derived = default_json2_url(web)
+        endpoint = prompt_url("JSON-2 URL", derived, default=endpoint or derived)
+        database = input(f"Odoo database (optional) [{database}]: ").strip() or database
+        label = "Odoo read-only API key" + (" (Enter keeps the current one)" if keep_key else "") + ": "
+        key = getpass.getpass(label, echo_char="*").strip() or None
+        if key is None and not keep_key:
+            print("API key must not be empty", file=sys.stderr)
+            continue
+        print("Checking the connection...", flush=True)
+        try:
+            config = connection(paths, web, endpoint, database)
+            OdooClient(config, key=key).check()
+        except ValueError as error:
+            print(f"{error}. Try again.", file=sys.stderr)
+            continue
+        break
+    save_settings(paths, config, key)
     print(f"Saved private configuration in {paths.config}")
+
+
+def configure_command(paths: Paths):
+    """`configure` on its own, as Tileception runs it: also start the first sync."""
+    configure(paths)
+    if (units_directory(paths) / SERVICE_NAME).exists():
+        start_background_sync()
+        print("Odoo synchronization started in the background; check it with tileception-odoo status.")
+    else:
+        print("Run tileception-odoo install to install the sync service.")
+
+
+def status_command(paths: Paths) -> dict:
+    """Tileception's `status`: whether setup is needed, and the launcher prompt that does it."""
+    from .server import Server
+
+    configured, detail = configuration_state(paths)
+    status = {"configured": configured, "detail": detail, "setup": setup_prompt(paths)}
+    status.update(Server(paths).status())
+    return status
+
+
+def uninstall(paths: Paths, purge: bool):
+    """Undo install: stop and remove the user units and the Tileception manifest."""
+    units = units_directory(paths)
+    if (units / TIMER_NAME).exists():
+        subprocess.run(["systemctl", "--user", "disable", "--now", TIMER_NAME], check=False, timeout=30)
+    if (units / SERVICE_NAME).exists():
+        subprocess.run(["systemctl", "--user", "stop", "--no-block", SERVICE_NAME], check=False, timeout=30)
+    for unit in (TIMER_NAME, SERVICE_NAME):
+        (units / unit).unlink(missing_ok=True)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False, timeout=30)
+    manifest_path(paths).unlink(missing_ok=True)
+    if purge:
+        for directory in (paths.config, paths.cache, paths.data):
+            if directory.is_dir() and not directory.is_symlink():
+                shutil.rmtree(directory)
+        print("Removed Odoo search, its configuration, API key, cache and model.")
+    else:
+        print(f"Removed Odoo search; configuration stays in {paths.config} (remove it with --purge).")
 
 
 def choose_projects(paths: Paths):
@@ -295,6 +342,8 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("serve", "sync", "configure", "setup-model", "status"):
         sub.add_parser(name)
+    remover = sub.add_parser("uninstall", help="stop and remove the sync service and plugin manifest")
+    remover.add_argument("--purge", action="store_true", help="also remove configuration, API key and cache")
     sub.add_parser("projects", help="choose which Odoo projects to synchronize")
     installer = sub.add_parser("install")
     installer.add_argument("--enable-timer", action="store_true")
@@ -320,13 +369,13 @@ def main():
         elif args.command == "install":
             install(paths, enable_timer=args.enable_timer, non_interactive=args.non_interactive)
         elif args.command == "configure":
-            configure(paths)
+            configure_command(paths)
+        elif args.command == "uninstall":
+            uninstall(paths, purge=args.purge)
         elif args.command == "projects":
             choose_projects(paths)
         elif args.command == "status":
-            from .server import Server
-
-            print(json.dumps(Server(paths).status(), indent=2))
+            print(json.dumps(status_command(paths), indent=2))
     except EOFError, KeyboardInterrupt:
         print("Configuration cancelled", file=sys.stderr)
         raise SystemExit(130) from None

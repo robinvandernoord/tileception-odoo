@@ -14,6 +14,7 @@ from . import __version__
 from .config import Config, Paths
 from .embeddings import Embedder
 from .progress import read_progress
+from .setup import configuration_state, setup_from_prompt, setup_prompt
 from .store import Store, launcher_row
 from .sync import scope
 
@@ -127,11 +128,23 @@ class Server:
                 )
         return rows
 
+    def setup_row(self, detail: str) -> dict:
+        prompt = setup_prompt(self.paths)
+        return {
+            "title": "Set up Odoo search",
+            "detail": detail,
+            "icon": "glyph:globe",
+            "actions": [{"title": "Set up", "type": "prompt", "prompt": prompt}],
+        }
+
     def search(self, arguments: dict) -> tuple[dict, tuple | None]:
         self.cancel()
         query = arguments.get("query", "")
         if not isinstance(query, str) or len(query) > 4096:
             raise ValueError("Query must be text of at most 4096 characters")
+        configured, detail = configuration_state(self.paths)
+        if not configured:
+            return tool({"rows": [self.setup_row(detail)]}), None
         if not query.strip():
             return tool({"rows": self.status_rows()}), None
         store = self.cache()
@@ -236,6 +249,17 @@ class Server:
                             },
                         ),
                         ("sync_now", "Start local background Odoo synchronization", {"type": "object"}),
+                        (
+                            "setup",
+                            "Check and save the Odoo connection, then start the first sync",
+                            {
+                                "type": "object",
+                                "properties": {
+                                    name: {"type": "string"}
+                                    for name in ("web_url", "json2_url", "database", "api_key")
+                                },
+                            },
+                        ),
                         ("status", "Last synchronization time and errors", {"type": "object"}),
                     ]
                 ]
@@ -257,6 +281,11 @@ class Server:
             return self.search(params.get("arguments", {}))
         if name == "status":
             return tool(self.status()), None
+        if name == "setup":
+            arguments = params.get("arguments", {})
+            if not isinstance(arguments, dict):
+                raise ValueError("Setup arguments must be an object")
+            return tool({"text": setup_from_prompt(self.paths, arguments)}), None
         if name == "sync_now":
             result = subprocess.run(
                 ["systemctl", "--user", "start", "--no-block", "tileception-odoo-sync.service"],
