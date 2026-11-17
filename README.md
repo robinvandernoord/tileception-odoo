@@ -9,7 +9,13 @@ The API key needs read access to `project.task`, `project.project` and
 
 ## Install
 
-In an activated Python 3.14+ virtual environment:
+From Tileception, type `plugins add robinvandernoord/tileception-odoo` in the
+launcher. Once installed, the launcher asks for the Odoo web URL, optional
+JSON-2 URL and database, and the API key, checks that they can read projects,
+saves them and starts the first sync in the background. Type
+`plugins configure odoo` to change them later; leave the key empty to keep it.
+
+By hand, in an activated Python 3.14+ virtual environment:
 
 ```sh
 uv pip install .
@@ -21,11 +27,14 @@ installs the manifest and user units, runs the first sync and offers the timer.
 Rerunning it reuses configuration and valid model files.
 
 Load the manifest with `tileception msg plugins reload`, or restart Tileception.
-For unattended setup, provide configuration and the key file first, then run
+For unattended setup, run
 `tileception-odoo install --non-interactive --enable-timer`. Without a terminal
 (or with `--non-interactive`), install never prompts and starts the first sync
 in the background instead of waiting for it; follow it with
-`tileception-odoo status`.
+`tileception-odoo status`. Without configuration it installs everything but
+the sync and `status` reports `"configured": false`; then set it up with
+`tileception-odoo configure`, in the launcher (`odoo ` shows **Set up Odoo
+search**), or by providing the configuration and key file first.
 
 ## Configuration
 
@@ -124,18 +133,16 @@ systemctl --user enable --now tileception-odoo-sync.timer
 
 ## Uninstall
 
+From Tileception: `plugins remove odoo`. By hand:
+
 ```sh
-systemctl --user disable --now tileception-odoo-sync.timer
-systemctl --user stop tileception-odoo-sync.service
-rm ~/.local/share/tileception/plugins/odoo.toml
-rm ~/.config/systemd/user/tileception-odoo-sync.{service,timer}
-systemctl --user daemon-reload
+tileception-odoo uninstall           # stops the timer, removes units and manifest
 tileception msg plugins reload
 uv pip uninstall tileception-odoo
 ```
 
-Credentials, cache and model files remain in the paths above unless removed
-separately.
+Configuration, the API key, cache and model files stay unless you run
+`tileception-odoo uninstall --purge`.
 
 ## Development
 
