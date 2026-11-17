@@ -22,7 +22,10 @@ Rerunning it reuses configuration and valid model files.
 
 Load the manifest with `tileception msg plugins reload`, or restart Tileception.
 For unattended setup, provide configuration and the key file first, then run
-`tileception-odoo install --enable-timer`.
+`tileception-odoo install --non-interactive --enable-timer`. Without a terminal
+(or with `--non-interactive`), install never prompts and starts the first sync
+in the background instead of waiting for it; follow it with
+`tileception-odoo status`.
 
 ## Configuration
 

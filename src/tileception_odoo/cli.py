@@ -116,7 +116,13 @@ def initial_sync(paths: Paths):
                 return
 
 
-def install(paths: Paths, enable_timer: bool):
+def start_background_sync():
+    """Queue the first sync without holding an unattended installer for its duration."""
+    subprocess.run(["systemctl", "--user", "start", "--no-block", "tileception-odoo-sync.service"], check=True)
+
+
+def install(paths: Paths, enable_timer: bool, non_interactive: bool = False):
+    interactive = sys.stdin.isatty() and not non_interactive
     command = shutil.which("tileception-odoo")
     if not command:
         raise ValueError("Install the package first with uv tool install .")
@@ -132,7 +138,7 @@ def install(paths: Paths, enable_timer: bool):
         settings = Config.load(paths, use_environment=False)
         settings.api_key(use_environment=False)
     except OSError, ValueError:
-        if not sys.stdin.isatty():
+        if not interactive:
             raise ValueError(
                 "Odoo configuration is incomplete. Run install in a terminal to enter your URLs and API key, "
                 "or provision the private configuration and key file before unattended installation."
@@ -152,6 +158,17 @@ def install(paths: Paths, enable_timer: bool):
         f'command = {json.dumps(command)}\nargs = ["serve"]\n[launcher]\nprefixes = ["odoo"]\n'
     )
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    if not interactive:
+        start_background_sync()
+        print(
+            "Initial Odoo synchronization started in the background; "
+            "check progress with tileception-odoo status.",
+            flush=True,
+        )
+        if enable_timer:
+            subprocess.run(["systemctl", "--user", "enable", "--now", "tileception-odoo-sync.timer"], check=True)
+        print("Odoo search is installed. Restart Tileception to discover the plugin.")
+        return
     print("Running the initial Odoo synchronization; this may take a while.", flush=True)
     try:
         initial_sync(paths)
@@ -174,7 +191,7 @@ def install(paths: Paths, enable_timer: bool):
             "journalctl --user -u tileception-odoo-sync.service, then rerun install. "
             "Your configuration and downloaded model have been kept."
         ) from None
-    if not enable_timer and sys.stdin.isatty():
+    if not enable_timer:
         enable_timer = input("Enable the 15-minute Odoo sync timer now? [y/N] ").strip().lower() in {
             "y",
             "yes",
@@ -281,6 +298,11 @@ def main():
     sub.add_parser("projects", help="choose which Odoo projects to synchronize")
     installer = sub.add_parser("install")
     installer.add_argument("--enable-timer", action="store_true")
+    installer.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="never prompt, and start the first sync in the background instead of waiting for it",
+    )
     args = parser.parse_args()
     paths = Paths.discover()
     try:
@@ -296,7 +318,7 @@ def main():
         elif args.command == "setup-model":
             setup_model(paths)
         elif args.command == "install":
-            install(paths, enable_timer=args.enable_timer)
+            install(paths, enable_timer=args.enable_timer, non_interactive=args.non_interactive)
         elif args.command == "configure":
             configure(paths)
         elif args.command == "projects":
